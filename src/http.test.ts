@@ -63,7 +63,9 @@ describe("Streamable HTTP MCP server", () => {
     await client.connect(transport as Transport);
     const tools = await client.listTools();
     expect(transport.sessionId).toBeTruthy();
-    expect(tools.tools.map((tool) => tool.name)).toContain("opnsense_get_firewall_logs");
+    expect(tools.tools.map((tool) => tool.name)).toEqual(
+      expect.arrayContaining(["opnsense_get_firewall_logs", "opnsense_list_instances"]),
+    );
     // Write-disabled deployments still expose scoped active diagnostics.
     expect(tools.tools.map((tool) => tool.name)).toEqual(expect.arrayContaining([
       "opnsense_ping", "opnsense_traceroute", "opnsense_probe_port",

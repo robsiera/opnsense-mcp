@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { ApiRequest, RiskAssessment } from "./types.js";
 
 interface Plan {
+  instance: string;
   digest: string;
   expiresAt: number;
   request: ApiRequest;
@@ -32,19 +33,22 @@ export class PlanStore {
     this.#ttlMs = ttlMs;
   }
 
-  create(request: ApiRequest, risk: RiskAssessment): { token: string; expiresAt: string } {
+  create(instance: string, request: ApiRequest, risk: RiskAssessment): { token: string; expiresAt: string } {
     this.#purge();
     const token = randomBytes(24).toString("base64url");
     const expiresAt = Date.now() + this.#ttlMs;
-    this.#plans.set(token, { digest: digest(request), expiresAt, request, risk });
+    this.#plans.set(token, { instance, digest: digest(request), expiresAt, request, risk });
     return { token, expiresAt: new Date(expiresAt).toISOString() };
   }
 
-  consume(token: string, request: ApiRequest): Plan {
+  consume(token: string, instance: string, request: ApiRequest): Plan {
     this.#purge();
     const plan = this.#plans.get(token);
     this.#plans.delete(token);
     if (!plan) throw new Error("The plan token is invalid, expired, or already used");
+    if (plan.instance !== instance) {
+      throw new Error(`The plan token belongs to instance "${plan.instance}", not "${instance}"`);
+    }
     if (plan.digest !== digest(request)) throw new Error("The request does not exactly match the approved plan");
     return plan;
   }

@@ -9,7 +9,8 @@
   "files": [
     "dist",
     "README.md",
-    ".env.example"
+    ".env.example",
+    "config.example.json"
   ],
   "scripts": {
     "clean": "node -e \"require('node:fs').rmSync('dist',{recursive:true,force:true})\"",

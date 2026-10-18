@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { z } from "zod";
+import type { OpnsenseTarget, WriteMode } from "./types.js";
 
 const booleanString = z
   .enum(["true", "false"])
@@ -11,6 +12,12 @@ const optionalBooleanString = z
   .optional()
   .transform((value) => value === "true");
 
+const instanceName = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/, "Instance names must be alphanumeric with optional _ or -");
+
 function csv(value: string | undefined): string[] {
   return (value ?? "")
     .split(",")
@@ -18,10 +25,13 @@ function csv(value: string | undefined): string[] {
     .filter(Boolean);
 }
 
-const schema = z.object({
-  OPNSENSE_URL: z.string().url(),
-  OPNSENSE_API_KEY: z.string().min(1),
-  OPNSENSE_API_SECRET: z.string().min(1),
+const envSchema = z.object({
+  OPNSENSE_URL: z.string().url().optional(),
+  OPNSENSE_API_KEY: z.string().min(1).optional(),
+  OPNSENSE_API_SECRET: z.string().min(1).optional(),
+  OPNSENSE_INSTANCE_NAME: instanceName.optional(),
+  OPNSENSE_DEFAULT_INSTANCE: instanceName.optional(),
+  OPNSENSE_CONFIG_PATH: z.string().min(1).optional(),
   OPNSENSE_WRITE_MODE: z.enum(["disabled", "plan", "enabled"]).default("disabled"),
   OPNSENSE_TLS_VERIFY: z
     .enum(["true", "false"])
@@ -44,19 +54,117 @@ const schema = z.object({
   MCP_RATE_LIMIT_PER_MINUTE: z.coerce.number().int().min(1).max(100_000).default(120),
 });
 
-export type Config = ReturnType<typeof loadConfig>;
+const fileInstanceSchema = z.object({
+  name: instanceName,
+  url: z.string().url(),
+  api_key: z.string().min(1),
+  api_secret: z.string().min(1),
+  write_mode: z.enum(["disabled", "plan", "enabled"]).optional(),
+  tls_verify: z.boolean().optional(),
+  allow_http: z.boolean().optional(),
+  ca_file: z.string().min(1).optional(),
+  timeout_ms: z.number().int().positive().max(300_000).optional(),
+  max_response_bytes: z.number().int().positive().max(50 * 1024 * 1024).optional(),
+});
 
-export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
-  const parsed = schema.parse(env);
-  const baseUrl = new URL(parsed.OPNSENSE_URL);
+const fileConfigSchema = z.object({
+  default: instanceName.optional(),
+  instances: z.array(fileInstanceSchema).min(1),
+});
+
+export type Config = {
+  instances: OpnsenseTarget[];
+  defaultInstance: string;
+  transport: "http" | "stdio";
+  http: {
+    host: string;
+    port: number;
+    path: string;
+    authToken: string | undefined;
+    allowUnauthenticated: boolean | undefined;
+    allowedHosts: string[];
+    allowedOrigins: string[];
+    maxSessions: number;
+    sessionTtlMs: number;
+    rateLimitPerMinute: number;
+  };
+};
+
+function buildTarget(input: {
+  name: string;
+  url: string;
+  apiKey: string;
+  apiSecret: string;
+  writeMode: WriteMode;
+  tlsVerify: boolean;
+  allowHttp: boolean;
+  caFile?: string;
+  timeoutMs: number;
+  maxResponseBytes: number;
+}): OpnsenseTarget {
+  const baseUrl = new URL(input.url);
+  if (baseUrl.protocol !== "https:" && !input.allowHttp) {
+    throw new Error(`Instance "${input.name}": URL must use HTTPS unless allow_http/OPNSENSE_ALLOW_HTTP=true`);
+  }
+  baseUrl.pathname = baseUrl.pathname.replace(/\/$/, "");
+  return {
+    name: input.name,
+    baseUrl,
+    apiKey: input.apiKey,
+    apiSecret: input.apiSecret,
+    writeMode: input.writeMode,
+    tlsVerify: input.tlsVerify,
+    ...(input.caFile ? { ca: readFileSync(input.caFile, "utf8") } : {}),
+    timeoutMs: input.timeoutMs,
+    maxResponseBytes: input.maxResponseBytes,
+  };
+}
+
+function loadInstancesFromFile(
+  path: string,
+  defaults: {
+    writeMode: WriteMode;
+    tlsVerify: boolean;
+    allowHttp: boolean;
+    caFile?: string;
+    timeoutMs: number;
+    maxResponseBytes: number;
+    defaultOverride?: string;
+  },
+): { instances: OpnsenseTarget[]; defaultInstance: string } {
+  const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  const file = fileConfigSchema.parse(raw);
+  const names = new Set<string>();
+  const instances = file.instances.map((entry) => {
+    if (names.has(entry.name)) {
+      throw new Error(`Duplicate OPNsense instance name "${entry.name}" in ${path}`);
+    }
+    names.add(entry.name);
+    return buildTarget({
+      name: entry.name,
+      url: entry.url,
+      apiKey: entry.api_key,
+      apiSecret: entry.api_secret,
+      writeMode: entry.write_mode ?? defaults.writeMode,
+      tlsVerify: entry.tls_verify ?? defaults.tlsVerify,
+      allowHttp: entry.allow_http ?? defaults.allowHttp,
+      ...(entry.ca_file ? { caFile: entry.ca_file } : defaults.caFile ? { caFile: defaults.caFile } : {}),
+      timeoutMs: entry.timeout_ms ?? defaults.timeoutMs,
+      maxResponseBytes: entry.max_response_bytes ?? defaults.maxResponseBytes,
+    });
+  });
+
+  const defaultInstance = defaults.defaultOverride ?? file.default ?? instances[0]!.name;
+  if (!names.has(defaultInstance)) {
+    throw new Error(`Default instance "${defaultInstance}" is not defined in ${path}`);
+  }
+  return { instances, defaultInstance };
+}
+
+export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
+  const parsed = envSchema.parse(env);
   const loopbackHosts = ["127.0.0.1", "localhost", "::1"];
   const allowedHosts = csv(parsed.MCP_ALLOWED_HOSTS);
-
-  if (baseUrl.protocol !== "https:" && !parsed.OPNSENSE_ALLOW_HTTP) {
-    throw new Error("OPNSENSE_URL must use HTTPS unless OPNSENSE_ALLOW_HTTP=true");
-  }
-
-  baseUrl.pathname = baseUrl.pathname.replace(/\/$/, "");
 
   if (parsed.MCP_TRANSPORT === "http") {
     if (!parsed.MCP_AUTH_TOKEN && !parsed.MCP_ALLOW_UNAUTHENTICATED) {
@@ -67,15 +175,50 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
     }
   }
 
-  return {
-    baseUrl,
-    apiKey: parsed.OPNSENSE_API_KEY,
-    apiSecret: parsed.OPNSENSE_API_SECRET,
+  const defaults = {
     writeMode: parsed.OPNSENSE_WRITE_MODE,
     tlsVerify: parsed.OPNSENSE_TLS_VERIFY,
-    ca: parsed.OPNSENSE_CA_FILE ? readFileSync(parsed.OPNSENSE_CA_FILE, "utf8") : undefined,
+    allowHttp: parsed.OPNSENSE_ALLOW_HTTP,
+    ...(parsed.OPNSENSE_CA_FILE ? { caFile: parsed.OPNSENSE_CA_FILE } : {}),
     timeoutMs: parsed.OPNSENSE_TIMEOUT_MS,
     maxResponseBytes: parsed.OPNSENSE_MAX_RESPONSE_BYTES,
+    ...(parsed.OPNSENSE_DEFAULT_INSTANCE ? { defaultOverride: parsed.OPNSENSE_DEFAULT_INSTANCE } : {}),
+  };
+
+  let instances: OpnsenseTarget[];
+  let defaultInstance: string;
+
+  if (parsed.OPNSENSE_CONFIG_PATH) {
+    ({ instances, defaultInstance } = loadInstancesFromFile(parsed.OPNSENSE_CONFIG_PATH, defaults));
+  } else if (parsed.OPNSENSE_URL && parsed.OPNSENSE_API_KEY && parsed.OPNSENSE_API_SECRET) {
+    const name = parsed.OPNSENSE_INSTANCE_NAME ?? "default";
+    instances = [
+      buildTarget({
+        name,
+        url: parsed.OPNSENSE_URL,
+        apiKey: parsed.OPNSENSE_API_KEY,
+        apiSecret: parsed.OPNSENSE_API_SECRET,
+        writeMode: defaults.writeMode,
+        tlsVerify: defaults.tlsVerify,
+        allowHttp: defaults.allowHttp,
+        ...(defaults.caFile ? { caFile: defaults.caFile } : {}),
+        timeoutMs: defaults.timeoutMs,
+        maxResponseBytes: defaults.maxResponseBytes,
+      }),
+    ];
+    defaultInstance = parsed.OPNSENSE_DEFAULT_INSTANCE ?? name;
+    if (defaultInstance !== name) {
+      throw new Error(`OPNSENSE_DEFAULT_INSTANCE="${defaultInstance}" does not match the single env instance "${name}"`);
+    }
+  } else {
+    throw new Error(
+      "Configure either OPNSENSE_CONFIG_PATH (multi-instance JSON) or OPNSENSE_URL + OPNSENSE_API_KEY + OPNSENSE_API_SECRET",
+    );
+  }
+
+  return {
+    instances,
+    defaultInstance,
     transport: parsed.MCP_TRANSPORT,
     http: {
       host: parsed.MCP_HOST,
@@ -90,4 +233,14 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env) {
       rateLimitPerMinute: parsed.MCP_RATE_LIMIT_PER_MINUTE,
     },
   };
+}
+
+export function resolveTarget(config: Config, instance?: string | undefined): OpnsenseTarget {
+  const name = instance ?? config.defaultInstance;
+  const target = config.instances.find((entry) => entry.name === name);
+  if (!target) {
+    const known = config.instances.map((entry) => entry.name).join(", ");
+    throw new Error(`Unknown OPNsense instance "${name}". Known instances: ${known}`);
+  }
+  return target;
 }

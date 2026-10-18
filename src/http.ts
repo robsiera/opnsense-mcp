@@ -9,9 +9,8 @@ import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { NextFunction, Request, Response } from "express";
 import { rateLimit } from "express-rate-limit";
 import type { Config } from "./config.js";
-import { OPNsenseClient } from "./client.js";
+import { InstanceRegistry } from "./instances.js";
 import { createServer } from "./server.js";
-import { Diagnostics } from "./diagnostics.js";
 
 interface Session {
   server: McpServer;
@@ -44,8 +43,7 @@ export interface RunningHttpServer {
 export async function startHttpServer(config: Config): Promise<RunningHttpServer> {
   const { http } = config;
   const app = createMcpExpressApp({ host: http.host, allowedHosts: http.allowedHosts });
-  const client = new OPNsenseClient(config);
-  const diagnostics = new Diagnostics(client);
+  const registry = new InstanceRegistry(config);
   const sessions = new Map<string, Session>();
 
   app.get("/health", (_req, res) => {
@@ -94,7 +92,7 @@ export async function startHttpServer(config: Config): Promise<RunningHttpServer
           return;
         }
 
-        const server = createServer(config, client, diagnostics);
+        const server = createServer(config, registry);
         let transport: StreamableHTTPServerTransport;
         transport = new StreamableHTTPServerTransport({
           sessionIdGenerator: randomUUID,
@@ -148,7 +146,7 @@ export async function startHttpServer(config: Config): Promise<RunningHttpServer
     close: async () => {
       clearInterval(cleanupTimer);
       await Promise.all([...sessions.keys()].map(closeSession));
-      await client.close();
+      await registry.close();
       await new Promise<void>((resolve, reject) => {
         httpServer.close((error) => (error ? reject(error) : resolve()));
       });

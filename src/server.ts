@@ -1,9 +1,9 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
 import type { Config } from "./config.js";
-import { OPNsenseClient } from "./client.js";
+import { InstanceRegistry } from "./instances.js";
 import { PlanStore } from "./plans.js";
-import { Diagnostics, registerDiagnostics } from "./diagnostics.js";
+import { registerDiagnostics } from "./diagnostics.js";
 import { assessRisk } from "./policy.js";
 import {
   firewallLogsRequest,
@@ -15,7 +15,7 @@ import {
   routeTableRequest,
   systemLogsRequest,
 } from "./read-only.js";
-import { apiRequestShape } from "./schema.js";
+import { apiRequestShape, optionalInstanceShape } from "./schema.js";
 import type { ApiRequest } from "./types.js";
 
 function toolResult(value: unknown, isError = false) {
@@ -35,27 +35,52 @@ function formatError(error: unknown) {
   };
 }
 
-export function createServer(config: Config, client = new OPNsenseClient(config), diagnostics = new Diagnostics(client)): McpServer {
+export function createServer(config: Config, registry = new InstanceRegistry(config)): McpServer {
   const server = new McpServer({ name: "opnsense-mcp", version: "0.2.0" });
   const plans = new PlanStore();
-  registerDiagnostics(server, diagnostics);
+  registerDiagnostics(server, registry);
 
   server.registerTool(
-    "opnsense_connection_info",
+    "opnsense_list_instances",
     {
-      description: "Show the configured OPNsense target and local safety policy. Credentials are never returned.",
+      description:
+        "List configured OPNsense instances (name, target origin, write mode). Credentials are never returned.",
       inputSchema: {},
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
     },
     async () =>
       toolResult({
-        target: config.baseUrl.origin,
-        writeMode: config.writeMode,
-        tlsVerification: config.tlsVerify,
-        customCaConfigured: config.ca !== undefined,
-        timeoutMs: config.timeoutMs,
-        maxResponseBytes: config.maxResponseBytes,
+        defaultInstance: registry.defaultInstance,
+        instances: registry.list(),
       }),
+  );
+
+  server.registerTool(
+    "opnsense_connection_info",
+    {
+      description:
+        "Show the configured OPNsense target and local safety policy for one instance (or the default). Credentials are never returned.",
+      inputSchema: optionalInstanceShape,
+      annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false },
+    },
+    async (input) => {
+      try {
+        const resolved = registry.resolve(input.instance);
+        return toolResult({
+          instance: resolved.name,
+          target: resolved.target.baseUrl.origin,
+          writeMode: resolved.target.writeMode,
+          tlsVerification: resolved.target.tlsVerify,
+          customCaConfigured: resolved.target.ca !== undefined,
+          timeoutMs: resolved.target.timeoutMs,
+          maxResponseBytes: resolved.target.maxResponseBytes,
+          defaultInstance: registry.defaultInstance,
+          instanceCount: config.instances.length,
+        });
+      } catch (error) {
+        return toolResult(formatError(error), true);
+      }
+    },
   );
 
   server.registerTool(
@@ -67,13 +92,15 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: true },
     },
     async (input) => {
-      const request = input as ApiRequest;
-      const risk = assessRisk(request);
-      if (risk.level !== "read") {
-        return toolResult({ error: "Endpoint is not classified as read-only", risk }, true);
-      }
       try {
-        return toolResult(await client.call(request));
+        const { instance, ...requestFields } = input;
+        const resolved = registry.resolve(instance);
+        const request = requestFields as ApiRequest;
+        const risk = assessRisk(request);
+        if (risk.level !== "read") {
+          return toolResult({ instance: resolved.name, error: "Endpoint is not classified as read-only", risk }, true);
+        }
+        return toolResult({ instance: resolved.name, ...(await resolved.client.call(request)) });
       } catch (error) {
         return toolResult(formatError(error), true);
       }
@@ -91,6 +118,7 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
     {
       description: "Read structured packet-filter log entries. This cannot stream or clear logs.",
       inputSchema: {
+        ...optionalInstanceShape,
         limit: z.number().int().min(1).max(5000).default(1000),
         digest: z.string().max(256).optional().describe("Optional digest returned by an earlier request for incremental reads"),
       },
@@ -98,7 +126,9 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
     },
     async (input) => {
       try {
-        return toolResult(await client.call(firewallLogsRequest(input)));
+        const { instance, ...fields } = input;
+        const resolved = registry.resolve(instance);
+        return toolResult({ instance: resolved.name, ...(await resolved.client.call(firewallLogsRequest(fields))) });
       } catch (error) {
         return toolResult(formatError(error), true);
       }
@@ -111,6 +141,7 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
       description:
         "Read a bounded page from an OPNsense system or service log. The endpoint is fixed to query mode and cannot clear, export, or stream logs.",
       inputSchema: {
+        ...optionalInstanceShape,
         scope: z.enum(LOG_SCOPES).describe("Log source"),
         ...pageShape,
         severities: z.array(z.enum(LOG_SEVERITIES)).max(LOG_SEVERITIES.length).optional(),
@@ -120,7 +151,9 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
     },
     async (input) => {
       try {
-        return toolResult(await client.call(systemLogsRequest(input)));
+        const { instance, ...fields } = input;
+        const resolved = registry.resolve(instance);
+        return toolResult({ instance: resolved.name, ...(await resolved.client.call(systemLogsRequest(fields))) });
       } catch (error) {
         return toolResult(formatError(error), true);
       }
@@ -132,6 +165,7 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
     {
       description: "List firewall filter rules visible to the OPNsense automation API. This cannot add, alter, toggle, move, or apply rules.",
       inputSchema: {
+        ...optionalInstanceShape,
         ...pageShape,
         category: z.string().uuid().optional().describe("Optional firewall category UUID"),
       },
@@ -139,7 +173,9 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
     },
     async (input) => {
       try {
-        return toolResult(await client.call(firewallRulesRequest(input)));
+        const { instance, ...fields } = input;
+        const resolved = registry.resolve(instance);
+        return toolResult({ instance: resolved.name, ...(await resolved.client.call(firewallRulesRequest(fields))) });
       } catch (error) {
         return toolResult(formatError(error), true);
       }
@@ -152,6 +188,7 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
       description:
         "List destination NAT, source NAT, one-to-one NAT, or IPv6 NPT rules. Automatic rules are included where OPNsense supplies them.",
       inputSchema: {
+        ...optionalInstanceShape,
         type: z.enum(NAT_TYPES),
         ...pageShape,
         category: z.string().uuid().optional().describe("Optional firewall category UUID"),
@@ -160,7 +197,9 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
     },
     async (input) => {
       try {
-        return toolResult(await client.call(natRulesRequest(input)));
+        const { instance, ...fields } = input;
+        const resolved = registry.resolve(instance);
+        return toolResult({ instance: resolved.name, ...(await resolved.client.call(natRulesRequest(fields))) });
       } catch (error) {
         return toolResult(formatError(error), true);
       }
@@ -173,6 +212,7 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
       description:
         "Read either the active kernel route table or configured static routes. Name resolution is disabled by default for predictable output.",
       inputSchema: {
+        ...optionalInstanceShape,
         source: z.enum(["active", "configured"]).default("active"),
         resolve: z.boolean().default(false).describe("Resolve active route addresses; ignored for configured routes"),
         ...pageShape,
@@ -181,7 +221,9 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
     },
     async (input) => {
       try {
-        return toolResult(await client.call(routeTableRequest(input)));
+        const { instance, ...fields } = input;
+        const resolved = registry.resolve(instance);
+        return toolResult({ instance: resolved.name, ...(await resolved.client.call(routeTableRequest(fields))) });
       } catch (error) {
         return toolResult(formatError(error), true);
       }
@@ -192,24 +234,42 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
     "opnsense_plan_change",
     {
       description:
-        "Assess a non-read OPNsense request and create a short-lived, one-time token. This tool does not contact or change OPNsense.",
+        "Assess a non-read OPNsense request and create a short-lived, one-time token bound to that instance. This tool does not contact or change OPNsense.",
       inputSchema: apiRequestShape,
       annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: false },
     },
     async (input) => {
-      const request = input as ApiRequest;
-      const risk = assessRisk(request);
-      if (risk.level === "read") {
-        return toolResult({ error: "This endpoint is read-classified; use opnsense_request instead", risk }, true);
+      try {
+        const { instance, ...requestFields } = input;
+        const resolved = registry.resolve(instance);
+        const request = requestFields as ApiRequest;
+        const risk = assessRisk(request);
+        if (risk.level === "read") {
+          return toolResult(
+            { instance: resolved.name, error: "This endpoint is read-classified; use opnsense_request instead", risk },
+            true,
+          );
+        }
+        if (resolved.target.writeMode === "disabled") {
+          return toolResult(
+            { instance: resolved.name, error: "Mutations are disabled by write_mode/OPNSENSE_WRITE_MODE=disabled", risk, request },
+            true,
+          );
+        }
+        if (resolved.target.writeMode === "plan") {
+          return toolResult({
+            instance: resolved.name,
+            executable: false,
+            risk,
+            request,
+            reason: "write_mode/OPNSENSE_WRITE_MODE=plan never issues execution tokens",
+          });
+        }
+        const plan = plans.create(resolved.name, request, risk);
+        return toolResult({ instance: resolved.name, executable: true, risk, request, ...plan });
+      } catch (error) {
+        return toolResult(formatError(error), true);
       }
-      if (config.writeMode === "disabled") {
-        return toolResult({ error: "Mutations are disabled by OPNSENSE_WRITE_MODE=disabled", risk, request }, true);
-      }
-      if (config.writeMode === "plan") {
-        return toolResult({ executable: false, risk, request, reason: "OPNSENSE_WRITE_MODE=plan never issues execution tokens" });
-      }
-      const plan = plans.create(request, risk);
-      return toolResult({ executable: true, risk, request, ...plan });
     },
   );
 
@@ -217,20 +277,21 @@ export function createServer(config: Config, client = new OPNsenseClient(config)
     "opnsense_execute_change",
     {
       description:
-        "Execute the exact OPNsense mutation previously assessed by opnsense_plan_change. Tokens expire after five minutes and can be used only once.",
+        "Execute the exact OPNsense mutation previously assessed by opnsense_plan_change on the same instance. Tokens expire after five minutes and can be used only once.",
       inputSchema: { ...apiRequestShape, planToken: z.string().min(1).describe("One-time token from opnsense_plan_change") },
       annotations: { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: true },
     },
     async (input) => {
-      if (config.writeMode !== "enabled") {
-        return toolResult({ error: "Execution requires OPNSENSE_WRITE_MODE=enabled" }, true);
-      }
-      const { planToken, ...requestInput } = input;
-      const request = requestInput as ApiRequest;
       try {
-        const plan = plans.consume(planToken, request);
-        const response = await client.call(request);
-        return toolResult({ risk: plan.risk, response });
+        const { instance, planToken, ...requestFields } = input;
+        const resolved = registry.resolve(instance);
+        if (resolved.target.writeMode !== "enabled") {
+          return toolResult({ instance: resolved.name, error: "Execution requires write_mode/OPNSENSE_WRITE_MODE=enabled" }, true);
+        }
+        const request = requestFields as ApiRequest;
+        const plan = plans.consume(planToken, resolved.name, request);
+        const response = await resolved.client.call(request);
+        return toolResult({ instance: resolved.name, risk: plan.risk, response });
       } catch (error) {
         return toolResult(formatError(error), true);
       }

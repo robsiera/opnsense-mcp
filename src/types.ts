@@ -22,3 +22,18 @@ export interface ApiResponse {
   contentType: string;
   data: unknown;
 }
+
+export type WriteMode = "disabled" | "plan" | "enabled";
+
+/** Connection settings for one OPNsense firewall. Credentials never leave this process. */
+export interface OpnsenseTarget {
+  name: string;
+  baseUrl: URL;
+  apiKey: string;
+  apiSecret: string;
+  writeMode: WriteMode;
+  tlsVerify: boolean;
+  ca?: string;
+  timeoutMs: number;
+  maxResponseBytes: number;
+}

@@ -1,0 +1,21 @@
+{
+  "default": "bxl",
+  "instances": [
+    {
+      "name": "bxl",
+      "url": "https://opnsense-bxl.example",
+      "api_key": "replace-me",
+      "api_secret": "replace-me",
+      "write_mode": "disabled",
+      "tls_verify": true
+    },
+    {
+      "name": "gra",
+      "url": "https://opnsense-gra.example",
+      "api_key": "replace-me",
+      "api_secret": "replace-me",
+      "write_mode": "disabled",
+      "tls_verify": true
+    }
+  ]
+}

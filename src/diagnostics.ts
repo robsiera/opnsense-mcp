@@ -2,9 +2,13 @@ import { isIP } from "node:net";
 import { setTimeout as delay } from "node:timers/promises";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { z } from "zod";
+import { optionalInstanceShape } from "./schema.js";
 import type { ApiRequest, ApiResponse } from "./types.js";
 
 type Caller = { call: (request: ApiRequest) => Promise<ApiResponse> };
+type DiagnosticsRegistry = {
+  resolve(instance?: string | undefined): { name: string; diagnostics: Diagnostics };
+};
 const hostname = z.string().min(1).max(253).refine(
   (value) => isIP(value) !== 0 || value.replace(/\.$/, "").split(".").every(
     (label) => /^[a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$/.test(label),
@@ -12,6 +16,7 @@ const hostname = z.string().min(1).max(253).refine(
 );
 const sourceAddress = z.string().refine((value) => isIP(value) !== 0, "Expected an IP address").optional();
 const common = {
+  ...optionalInstanceShape,
   host: hostname,
   family: z.enum(["ipv4", "ipv6"]).default("ipv4"),
   sourceAddress,
@@ -128,27 +133,31 @@ export class Diagnostics {
   }
 }
 
-export function registerDiagnostics(server: McpServer, diagnostics: Diagnostics): void {
+export function registerDiagnostics(server: McpServer, registry: DiagnosticsRegistry): void {
   const annotations = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: true };
-  const output = async (action: () => Promise<unknown>) => {
+  const output = async (instance: string | undefined, action: (diagnostics: Diagnostics) => Promise<unknown>) => {
     try {
-      const result = await action();
+      const resolved = registry.resolve(instance);
+      const result = await action(resolved.diagnostics);
       const failed = result && typeof result === "object" && ("error" in result || "cleanupErrors" in result);
-      return { content: [{ type: "text" as const, text: JSON.stringify(result, null, 2) }], ...(failed ? { isError: true } : {}) };
+      return {
+        content: [{ type: "text" as const, text: JSON.stringify({ instance: resolved.name, ...(result as object) }, null, 2) }],
+        ...(failed ? { isError: true } : {}),
+      };
     } catch (error) {
       return { content: [{ type: "text" as const, text: JSON.stringify({ error: error instanceof Error ? error.message : String(error) }) }], isError: true };
     }
   };
   server.registerTool("opnsense_ping", {
-    description: "Run a short ping from OPNsense, collect its statistics, and stop/remove only the job created by this call. Available with configuration writes disabled; requires diagnostic ACL privileges.",
+    description: "Run a short ping from OPNsense, collect its statistics, and stop/remove only the job created by this call. Available with configuration writes disabled; requires diagnostic ACL privileges. Concurrent diagnostics are limited per instance.",
     inputSchema: pingSchema.shape, annotations,
-  }, (args) => output(() => diagnostics.ping(args)));
+  }, (args) => output(args.instance, (diagnostics) => diagnostics.ping(args)));
   server.registerTool("opnsense_traceroute", {
     description: "Run an IPv4/IPv6 UDP or ICMP traceroute from OPNsense without saving configuration. Available with configuration writes disabled. OPNsense controls probe limits; HTTP timeout does not cancel backend execution.",
     inputSchema: tracerouteSchema.shape, annotations,
-  }, (args) => output(() => diagnostics.traceroute(args)));
+  }, (args) => output(args.instance, (diagnostics) => diagnostics.traceroute(args)));
   server.registerTool("opnsense_probe_port", {
     description: "Test one TCP port from OPNsense without saving configuration or reading remote banners. Available with configuration writes disabled; not a port-range scanner.",
     inputSchema: portProbeSchema.shape, annotations,
-  }, (args) => output(() => diagnostics.portProbe(args)));
+  }, (args) => output(args.instance, (diagnostics) => diagnostics.portProbe(args)));
 }

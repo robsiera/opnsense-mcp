@@ -2,7 +2,7 @@
 
 A safety-focused remote Model Context Protocol server for OPNsense's MVC API. It exposes stateful Streamable HTTP for remote agents, uses the API's native HTTP Basic authentication upstream, and fails closed when it cannot determine whether an OPNsense command is read-only.
 
-One server instance represents one OPNsense firewall. The firewall URL and API credentials stay in the server environment; agents authenticate to MCP with a separate bearer token and cannot redirect requests to arbitrary network targets. Deploy one isolated instance per firewall when managing multiple appliances.
+One MCP process can manage one or more OPNsense firewalls. Targets and API credentials stay in the server environment or a local JSON config file; agents never supply firewall URLs or credentials. Agents authenticate to MCP with a separate bearer token (HTTP) and select a firewall with an optional `instance` tool argument. Mutation plan tokens are bound to the instance they were created for.
 
 ## Architecture
 
@@ -85,7 +85,7 @@ These tools call fixed query endpoints directly. They cannot select mutating sib
 - `opnsense_traceroute`: IPv4/IPv6 UDP or ICMP traceroute.
 - `opnsense_probe_port`: one TCP connectivity test, without fetching remote banners.
 
-These tools generate network traffic and temporary runtime state, so they are marked non-destructive but **not** read-only in MCP annotations. They do not save firewall configuration or enable arbitrary `set`, `start`, `stop`, or `remove` calls through the generic request tool. Only one active diagnostic runs per deployment at a time.
+These tools generate network traffic and temporary runtime state, so they are marked non-destructive but **not** read-only in MCP annotations. They do not save firewall configuration or enable arbitrary `set`, `start`, `stop`, or `remove` calls through the generic request tool. Only one active diagnostic runs per OPNsense instance at a time.
 
 For example, call `opnsense_ping` with `{"host":"1.1.1.1","durationSeconds":3}` while configuration writes remain disabled.
 
@@ -179,12 +179,25 @@ node dist/index.js
 
 ### Configuration
 
-- `OPNSENSE_URL`: fixed firewall base URL.
-- `OPNSENSE_API_KEY`: API key for the dedicated OPNsense user.
-- `OPNSENSE_API_SECRET`: API secret for that key.
+**Single instance (env)**
+
+- `OPNSENSE_URL`: firewall base URL.
+- `OPNSENSE_API_KEY` / `OPNSENSE_API_SECRET`: dedicated API credentials.
+- `OPNSENSE_INSTANCE_NAME`: optional label (default `default`).
 - `OPNSENSE_WRITE_MODE`: `disabled`, `plan`, or `enabled`.
 - `OPNSENSE_CA_FILE`: optional private CA PEM file.
 - `OPNSENSE_TLS_VERIFY`: defaults to `true`.
+
+**Multiple instances (JSON file)**
+
+- `OPNSENSE_CONFIG_PATH`: absolute path to a JSON file (see [`config.example.json`](config.example.json)).
+- `OPNSENSE_DEFAULT_INSTANCE`: optional override of the file's `default`.
+- Per-instance fields: `name`, `url`, `api_key`, `api_secret`, optional `write_mode`, `tls_verify`, `allow_http`, `ca_file`, `timeout_ms`, `max_response_bytes`.
+- Env `OPNSENSE_WRITE_MODE` / TLS / timeout defaults apply to file instances that omit those fields.
+- Do not set `OPNSENSE_URL` together with `OPNSENSE_CONFIG_PATH` (the config file wins when the path is set).
+
+**MCP transport**
+
 - `MCP_TRANSPORT`: `http` by default, or `stdio`.
 - `MCP_HOST`: listener address, default `127.0.0.1`.
 - `MCP_PORT`: listener port, default `3000`.
@@ -196,14 +209,25 @@ node dist/index.js
 - `MCP_SESSION_TTL_MS`: idle session lifetime, default one hour.
 - `MCP_RATE_LIMIT_PER_MINUTE`: per-client HTTP request limit, default `120`.
 
-For example, a read call for system status uses:
+Tools accept an optional `instance` argument. Omit it to use the configured default. Use `opnsense_list_instances` to discover names.
+
+For example, a read call for system status on instance `gra`:
 
 ```json
 {
+  "instance": "gra",
   "module": "core",
   "controller": "system",
   "command": "status"
 }
+```
+
+Stdio multi-instance example:
+
+```sh
+OPNSENSE_CONFIG_PATH=/secure/path/opnsense-instances.json \
+MCP_TRANSPORT=stdio \
+node dist/index.js
 ```
 
 ## Current Limits

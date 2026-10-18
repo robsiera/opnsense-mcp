@@ -1,6 +1,5 @@
 import { Agent, request as httpRequest } from "undici";
-import type { Config } from "./config.js";
-import type { ApiRequest, ApiResponse } from "./types.js";
+import type { ApiRequest, ApiResponse, OpnsenseTarget } from "./types.js";
 
 const SEGMENT_PATTERN = /^[A-Za-z0-9_-]+$/;
 
@@ -46,25 +45,29 @@ async function readBoundedBody(body: AsyncIterable<Uint8Array>, maximum: number)
 }
 
 export class OPNsenseClient {
-  readonly #config: Config;
+  readonly #target: OpnsenseTarget;
   readonly #dispatcher: Agent;
 
-  constructor(config: Config) {
-    this.#config = config;
+  constructor(target: OpnsenseTarget) {
+    this.#target = target;
     this.#dispatcher = new Agent({
       connect: {
-        rejectUnauthorized: config.tlsVerify,
-        ...(config.ca ? { ca: config.ca } : {}),
+        rejectUnauthorized: target.tlsVerify,
+        ...(target.ca ? { ca: target.ca } : {}),
       },
     });
   }
 
+  get name(): string {
+    return this.#target.name;
+  }
+
   async call(apiRequest: ApiRequest): Promise<ApiResponse> {
-    const url = buildApiUrl(this.#config.baseUrl, apiRequest);
+    const url = buildApiUrl(this.#target.baseUrl, apiRequest);
     const method = apiRequest.method ?? (apiRequest.body === undefined ? "GET" : "POST");
     const controller = new AbortController();
-    const timeout = setTimeout(() => controller.abort(), this.#config.timeoutMs);
-    const authorization = Buffer.from(`${this.#config.apiKey}:${this.#config.apiSecret}`).toString("base64");
+    const timeout = setTimeout(() => controller.abort(), this.#target.timeoutMs);
+    const authorization = Buffer.from(`${this.#target.apiKey}:${this.#target.apiSecret}`).toString("base64");
 
     try {
       const response = await httpRequest(url, {
@@ -79,7 +82,7 @@ export class OPNsenseClient {
         ...(apiRequest.body !== undefined ? { body: JSON.stringify(apiRequest.body) } : {}),
       });
       const contentType = String(response.headers["content-type"] ?? "");
-      const text = await readBoundedBody(response.body, this.#config.maxResponseBytes);
+      const text = await readBoundedBody(response.body, this.#target.maxResponseBytes);
       let data: unknown = text;
       if (contentType.includes("application/json") || /^[\s]*[\[{]/.test(text)) {
         try {

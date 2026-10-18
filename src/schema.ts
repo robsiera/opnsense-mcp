@@ -2,7 +2,20 @@ import { z } from "zod";
 
 const segment = z.string().min(1).max(128).regex(/^[A-Za-z0-9_-]+$/);
 
+export const instanceField = z
+  .string()
+  .min(1)
+  .max(64)
+  .regex(/^[A-Za-z0-9][A-Za-z0-9_-]*$/)
+  .optional()
+  .describe("Named OPNsense instance from the server config; omits to use the configured default");
+
+export const optionalInstanceShape = {
+  instance: instanceField,
+};
+
 export const apiRequestShape = {
+  ...optionalInstanceShape,
   module: segment.describe("API module, for example 'core' or 'firewall'"),
   controller: segment.describe("API controller, for example 'system' or 'filter'"),
   command: segment.describe("API command, for example 'status' or 'search_rule'"),

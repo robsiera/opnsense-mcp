@@ -12,19 +12,25 @@ describe("PlanStore", () => {
   };
   const risk: RiskAssessment = { level: "write", reason: "test" };
 
-  it("accepts the exact request once", () => {
+  it("accepts the exact request once on the same instance", () => {
     const plans = new PlanStore();
-    const { token } = plans.create(request, risk);
-    expect(plans.consume(token, request).risk).toEqual(risk);
-    expect(() => plans.consume(token, request)).toThrow("invalid, expired, or already used");
+    const { token } = plans.create("bxl", request, risk);
+    expect(plans.consume(token, "bxl", request).risk).toEqual(risk);
+    expect(() => plans.consume(token, "bxl", request)).toThrow("invalid, expired, or already used");
   });
 
   it("rejects a changed body and consumes the token", () => {
     const plans = new PlanStore();
-    const { token } = plans.create(request, risk);
+    const { token } = plans.create("bxl", request, risk);
     expect(() =>
-      plans.consume(token, { ...request, body: { rule: { description: "allow all", enabled: "1" } } }),
+      plans.consume(token, "bxl", { ...request, body: { rule: { description: "allow all", enabled: "1" } } }),
     ).toThrow("does not exactly match");
-    expect(() => plans.consume(token, request)).toThrow("invalid, expired, or already used");
+    expect(() => plans.consume(token, "bxl", request)).toThrow("invalid, expired, or already used");
+  });
+
+  it("rejects using a plan token against another instance", () => {
+    const plans = new PlanStore();
+    const { token } = plans.create("bxl", request, risk);
+    expect(() => plans.consume(token, "gra", request)).toThrow('belongs to instance "bxl"');
   });
 });
